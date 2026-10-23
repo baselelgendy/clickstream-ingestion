@@ -1,0 +1,94 @@
+# Whole local pipeline with ONE command:   docker compose up --build
+#
+#   prepare ──► (generate the 12 CSVs if they do not exist yet)
+#   kafka ────► kafka-init ──► (create topics)
+#   consumer ─► Kafka -> S3 (streamed tables), keeps running
+#   replay ───► CSVs -> Kafka (streamed tables), exits when done
+#   dimensions► 7 static tables -> S3, exits when done
+#
+# Settings: .env.   AWS keys: your ~/.aws folder (from `aws configure`), mounted read-only.
+
+x-app: &app
+  build: .
+  image: clickstream-ingestion:latest
+  env_file: .env
+  environment: &app-env
+    # Inside the compose network Kafka is "kafka:19092" (localhost:9092 is for your computer).
+    KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+    PYTHONPATH: /app
+  volumes:
+    - ./data:/app/data
+    - ./logs:/app/logs
+    - ~/.aws:/root/.aws:ro
+
+services:
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    ports:
+      - "9092:9092"          # for tools running on your computer (CLI, Kafka UI, ...)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      # INTERNAL = containers, EXTERNAL = your computer. Change KAFKA_ADVERTISED_HOST in .env
+      # to this machine's IP if something on ANOTHER computer must reach it.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://${KAFKA_ADVERTISED_HOST:-localhost}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data       # topics survive `docker compose down`
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+
+  kafka-init:
+    <<: *app
+    command: python -m src.producer.create_topics
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
+  prepare:
+    <<: *app
+    command: python -m src.batch.prepare_data
+    restart: "no"
+
+  consumer:
+    <<: *app
+    command: python -m src.consumer.s3_writer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  replay:
+    <<: *app
+    command: python -m src.producer.replay_events
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      prepare:
+        condition: service_completed_successfully
+    restart: "no"
+
+  dimensions:
+    <<: *app
+    command: python -m src.batch.upload_dimensions
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    restart: "no"
+
+volumes:
+  kafka-data:

@@ -1,0 +1,9 @@
+# Ingestion (Kafka -> S3)
+# If kafka-python fails on your Python version, use kafka-python-ng instead.
+kafka-python
+boto3
+python-dotenv
+
+# Teammate's generator + validator
+pandas
+numpy
